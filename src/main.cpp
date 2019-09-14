@@ -1,74 +1,45 @@
 // TODO
-// * Set up ADC
-//     - self-calibration
-// * Set up DMA
-//     - alloc buffer, how big?
-// * Figure out where set ADC<->DMA speed
-// * Output on serial
-
+// Control input channel
 #include <Arduino.h>
 #include <STM32ADC.h>
 #include <libmaple/timer.h>
 #include <libmaple/usart.h>
 
+static const uint32_t adc_timer_prescaler = 64;
+static const uint32_t adc_timer_arr = 64;
+static const uint32_t adc_samplerate = CLOCK_SPEED_HZ / adc_timer_prescaler / adc_timer_arr;
+
+
+enum error_type {
+    NO_ERROR = 0,
+    USART_BUSY_ERROR = 1,
+    ADC_DMA_ERROR = 1<<2,
+    USART_DMA_ERROR = 1<<3,
+};
+volatile uint32_t error = NO_ERROR;
+
 STM32ADC myADC(ADC1);
 //Channels to be acquired.
 uint8 pins[] = {PA0, PA1};
 
+
 const size_t nPins = sizeof(pins) / sizeof(uint8);
 
 // Array for the ADC data
-const size_t adc_buffer_len = 20 * nPins;
+const size_t adc_buffer_len = 200 * nPins;
 uint16_t adc_buffer[adc_buffer_len];
 
-uint32 nirqs = 0;
-volatile bool did_irq = false;
-volatile bool handle_half_complete = false;
-volatile bool handle_complete = false;
-volatile bool dma_error = false;
-uint32 nirqs_e = 0;
 uint32 nirqs_o = 0;
 
-
-void dma_irq_handler()
-{
-  const auto irq_cause = dma_get_irq_cause(DMA1, DMA_CH1);
-  nirqs++;
-  did_irq = true;
-  switch (irq_cause)
-  {
-  case DMA_TRANSFER_HALF_COMPLETE:
-    handle_half_complete = true;
-    break;
-
-  case DMA_TRANSFER_COMPLETE:
-    handle_complete = true;
-    break;
-
-  case DMA_TRANSFER_ERROR:
-    dma_error = true;
-    break;
-
-  default:
-    nirqs_o++;
-    break;
-  }
-  return;
-}
-
-volatile bool got_usart_irq = false;
 volatile bool usart_busy = false;
-volatile dma_irq_cause usart_irq_cause;
-
-void usart_irq_handler()
-{
-  usart_irq_cause = dma_get_irq_cause(DMA1, DMA_CH4);
-  usart_busy = false;
-  got_usart_irq = true; 
-}
 
 
-void _dump_half(bool second_half) {
+/* Dump half ADC buffer on usart */
+void trigger_adc_buffer_to_usart(bool second_half) {
+  if (usart_busy) {
+    error |= USART_BUSY_ERROR;
+    return;
+  }
   usart_busy = true;
   dma_setup_transfer(
       DMA1,
@@ -81,24 +52,55 @@ void _dump_half(bool second_half) {
   dma_set_num_transfers(DMA1, DMA_CH4, adc_buffer_len / 2);
   dma_enable(DMA1, DMA_CH4);
 }
-void dump_first_half()
-{
-  _dump_half(false);
-} 
 
-void dump_second_half()
+void adc_dma_irq_handler()
 {
-  _dump_half(true);
-} 
+  const auto irq_cause = dma_get_irq_cause(DMA1, DMA_CH1);
+  switch (irq_cause)
+  {
+  case DMA_TRANSFER_HALF_COMPLETE:
+    trigger_adc_buffer_to_usart(false);
+    break;
+
+  case DMA_TRANSFER_COMPLETE:
+    trigger_adc_buffer_to_usart(true);
+    break;
+
+  case DMA_TRANSFER_ERROR:
+    error |= ADC_DMA_ERROR;
+    break;
+
+  default:
+    break;
+  }
+  return;
+}
+
+volatile bool got_usart_irq = false;
+volatile dma_irq_cause usart_irq_cause;
+
+/* Reset usart busy when data has been transferred */
+void usart_irq_handler()
+{
+  usart_irq_cause = dma_get_irq_cause(DMA1, DMA_CH4);
+  switch (usart_irq_cause) {
+  case DMA_TRANSFER_ERROR:
+    error |= USART_DMA_ERROR;
+  default:
+    break;
+  }
+  usart_busy = false;
+  got_usart_irq = true; 
+}
 
 void setup_timer()
 {
   // TODO: WTF, timer_init makes it not work, while just rcc_clk_enable is fine...
   // timer_init(TIMER1);
   rcc_clk_enable(TIMER1->clk_id);
-  timer_set_prescaler(TIMER1, 1024);
-  timer_set_reload(TIMER1, 1024);
-  timer_set_compare(TIMER1, TIMER_CH1, 32);
+  timer_set_prescaler(TIMER1, adc_timer_prescaler);
+  timer_set_reload(TIMER1, adc_timer_arr);
+  timer_set_compare(TIMER1, TIMER_CH1, adc_timer_arr / 2);
   timer_oc_set_mode(TIMER1, TIMER_CH1, TIMER_OC_MODE_PWM_1, 0);
   timer_cc_enable(TIMER1, TIMER_CH1);
   timer_cc_set_pol(TIMER1, TIMER_CH1, 1);
@@ -121,7 +123,7 @@ void setup_adc()
 
   delay_us(1000); // Maybe not needed, whatever
 
-  //calibrate ADC
+  // ADC calibration should be done at startup
   myADC.calibrate();
 
   // myADC.setSampleRate(ADC_SMPR_1_5); //set the Sample Rate
@@ -139,7 +141,7 @@ void setup_adc()
       adc_buffer,
       adc_buffer_len,
       (DMA_MINC_MODE | DMA_CIRC_MODE | DMA_HALF_TRNS | DMA_TRNS_CMPLT),
-      dma_irq_handler);
+      adc_dma_irq_handler);
 
   //start the conversion.
   //because the ADC is set as continuous mode and in circular fashion, this can be done
@@ -147,11 +149,19 @@ void setup_adc()
   myADC.startConversion();
 }
 
+void stop()
+{
+  timer_pause(TIMER1);
+}
+
+void start()
+{
+  timer_resume(TIMER1);
+}
+
 void setup()
 {
-  Serial1.begin(614400);
-  Serial1.println("Serial1");
-  Serial1.println("Serial1 agin");
+  Serial1.begin(1000000);
 
   for (size_t i = 0; i < adc_buffer_len; i++) {
     adc_buffer[i] = 0;
@@ -165,91 +175,10 @@ void setup()
   setup_adc();
 }
 
-
-bool too_slow = false;
-void dump_buffer() {
-  did_irq = false;
-  if (usart_busy) {
-    Serial1.println("USART BUSY!!");
-    too_slow = true;
-    return;
-  }
-  if (handle_half_complete) {
-    handle_half_complete = false;
-    dump_first_half();
-  }
-
-  if (handle_complete) {
-    handle_complete = false;
-    dump_second_half();
-  }
-
-  if (did_irq) {
-    too_slow = true;
-  }
-}
-
-
-uint64 step = 0;
-uint64 nirq_last = 0;
-uint32 t_last = 0;
-bool run = true;
-
 void loop()
 {
-  //send the latest data acquired when the button is pushed.
+  // Everything relies on interrupts, do nothing
+  asm("wfi \n");
 
-  // TODO critical region
-  // if (!did_irq) {
-  //   return;
-  // }
-  if (did_irq) {
-    dump_buffer();
-  }
-
-  step++;
-  if (step % 500000 == 0)
-  {
-    uint32 t_now = millis();
-    uint32 t_elapsed = t_now - t_last;
-    // One IRQ per half transfer
-    // 16 bytes per point, but only half of them
-    auto n_points = adc_buffer_len * (nirqs - nirq_last);
-    auto kbps = (16 / 2 * n_points) / t_elapsed;
-    nirq_last = nirqs;
-    t_last = t_now;
-
-    uint16 counter = timer_get_count(TIMER1);
-    uint32 reading = myADC.getData();
-    Serial1.println("----------");
-    Serial1.print("TIM1.SR: ");
-    Serial1.println(timer_get_status(TIMER1));
-    Serial1.print("ADC1.CR2: ");
-    Serial1.println(ADC1->regs->CR2);
-    Serial1.print("First meassures: ");
-    Serial1.print(adc_buffer[0]);
-    Serial1.print(", ");
-    Serial1.println(adc_buffer[1]);
-    Serial1.print("counter: ");
-    Serial1.println(counter);
-    Serial1.print("reading: ");
-    Serial1.println(reading);
-    Serial1.print("kbps: ");
-    Serial1.println(kbps);
-    Serial1.print("nirqs: ");
-    Serial1.println(nirqs); 
-    Serial1.print("nirqs_e: ");
-    Serial1.println(nirqs_e);
-    Serial1.print("err: ");
-    Serial1.println(dma_error);
-    Serial1.print("too_slow: ");
-    Serial1.println(too_slow);
-    Serial1.print("got_usart_irq: ");
-    Serial1.println(got_usart_irq);
-    Serial1.print("usart_irq_cause: ");
-    Serial1.println(usart_irq_cause);
-    run = true;
-    got_usart_irq = false;
-  }
-
-}; //end loop
+  // TODO, if error, then set LED or somesuch
+};

@@ -5,23 +5,29 @@
 #include <libmaple/timer.h>
 #include <libmaple/usart.h>
 
-static const uint32_t adc_timer_prescaler = 64;
+static const uint32_t adc_timer_prescaler = 32;
 static const uint32_t adc_timer_arr = 64;
 static const uint32_t adc_samplerate = CLOCK_SPEED_HZ / adc_timer_prescaler / adc_timer_arr;
 
+enum commands
+{
+  CMD_STOP = 1,
+  CMD_START = 2,
+  CMD_GET_SAMPLERATE = 3,
+};
 
-enum error_type {
-    NO_ERROR = 0,
-    USART_BUSY_ERROR = 1,
-    ADC_DMA_ERROR = 1<<2,
-    USART_DMA_ERROR = 1<<3,
+enum error_type
+{
+  NO_ERROR = 0,
+  USART_BUSY_ERROR = 1,
+  ADC_DMA_ERROR = 1 << 2,
+  USART_DMA_ERROR = 1 << 3,
 };
 volatile uint32_t error = NO_ERROR;
 
 STM32ADC myADC(ADC1);
 //Channels to be acquired.
 uint8 pins[] = {PA0, PA1};
-
 
 const size_t nPins = sizeof(pins) / sizeof(uint8);
 
@@ -33,10 +39,11 @@ uint32 nirqs_o = 0;
 
 volatile bool usart_busy = false;
 
-
 /* Dump half ADC buffer on usart */
-void trigger_adc_buffer_to_usart(bool second_half) {
-  if (usart_busy) {
+void trigger_adc_buffer_to_usart(bool second_half)
+{
+  if (usart_busy)
+  {
     error |= USART_BUSY_ERROR;
     return;
   }
@@ -77,20 +84,20 @@ void adc_dma_irq_handler()
 }
 
 volatile bool got_usart_irq = false;
-volatile dma_irq_cause usart_irq_cause;
 
 /* Reset usart busy when data has been transferred */
 void usart_irq_handler()
 {
-  usart_irq_cause = dma_get_irq_cause(DMA1, DMA_CH4);
-  switch (usart_irq_cause) {
+  const dma_irq_cause usart_irq_cause = dma_get_irq_cause(DMA1, DMA_CH4);
+  switch (usart_irq_cause)
+  {
   case DMA_TRANSFER_ERROR:
     error |= USART_DMA_ERROR;
   default:
     break;
   }
   usart_busy = false;
-  got_usart_irq = true; 
+  got_usart_irq = true;
 }
 
 void setup_timer()
@@ -159,26 +166,75 @@ void start()
   timer_resume(TIMER1);
 }
 
+void handle_cmd(uint8_t cmd)
+{
+  switch (cmd)
+  {
+  case CMD_STOP:
+    stop();
+    break;
+  case CMD_START:
+    start();
+    break;
+  case CMD_GET_SAMPLERATE:
+    Serial1.println(adc_samplerate);
+    break;
+  }
+}
+
+extern "C"
+{
+  void __irq_usart1(void)
+  {
+    // Reading clears the thing
+    uint8_t cmd = 0;
+    while ((USART1_BASE->SR & USART_SR_RXNE) != 0)
+    {
+      cmd = USART1_BASE->DR & 0xff;
+    };
+    if (cmd != 0)
+    {
+      handle_cmd(cmd);
+    }
+
+    // This just ties in to existing Serial stuff so Serial1.print keeps working
+    /* TXE signifies readiness to send a byte to DR. */
+    if ((USART1_BASE->CR1 & USART_CR1_TXEIE) && (USART1_BASE->SR & USART_SR_TXE))
+    {
+      if (!rb_is_empty(USART1->wb))
+        USART1_BASE->DR = rb_remove(USART1->wb);
+      else
+        USART1_BASE->CR1 &= ~((uint32)USART_CR1_TXEIE); // disable TXEIE
+    }
+  }
+}
+
 void setup()
 {
   Serial1.begin(1000000);
 
-  for (size_t i = 0; i < adc_buffer_len; i++) {
+  for (size_t i = 0; i < adc_buffer_len; i++)
+  {
     adc_buffer[i] = 0;
   }
 
   // Prepare usart DMA
   USART1->regs->CR3 |= USART_CR3_DMAT;
+
+  // Interrupt on incoming
+  USART1->regs->CR1 |= USART_CR1_RXNEIE;
+
   dma_attach_interrupt(DMA1, DMA_CH4, usart_irq_handler);
 
   setup_timer();
   setup_adc();
+
+  stop(); // TODO no!
 }
 
 void loop()
 {
   // Everything relies on interrupts, do nothing
   asm("wfi \n");
-
   // TODO, if error, then set LED or somesuch
 };

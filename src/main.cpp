@@ -9,6 +9,12 @@ static const uint32_t adc_timer_prescaler = 32;
 static const uint32_t adc_timer_arr = 64;
 static const uint32_t adc_samplerate = CLOCK_SPEED_HZ / adc_timer_prescaler / adc_timer_arr;
 
+// A0 and A1,   used to meassure signal
+// TIM1 (timer) that tells ADC to meassure
+// ADC (analog 2 digital converter)  gives us 12bit measurment of voltage
+// DMA (direct memory access)  shuffles them to RAM
+// DMA shuffles the RAM out over serial data port to computer
+
 enum commands
 {
   CMD_STOP = 1,

@@ -5,9 +5,28 @@
 #include <libmaple/timer.h>
 #include <libmaple/usart.h>
 
+static const uint8_t error_pin = 25; // 25 = B12
+
+static const uint32_t adc_clock = CLOCK_SPEED_HZ / 8; /// NOTE: configured in setup(), should match!
 static const uint32_t adc_timer_prescaler = 32;
 static const uint32_t adc_timer_arr = 64;
 static const uint32_t adc_samplerate = CLOCK_SPEED_HZ / adc_timer_prescaler / adc_timer_arr;
+// Time to *perform* one sample
+// 11.6:
+// Tconv  = sampling time + 12.5
+// with 7.5 cycles sampling time, TConv = 19.5 adc cycles
+// with 72MHz cpu clock, and 8 divider on adc
+// total time = (19.5 cycles) / (72 MHz / 8) = 2.17µs
+// so can go up to 460ksps with current settings, but transmission is bottleneck
+//
+// With adc div 8,  sample time 77.5 cycles, 72MHz clock
+// 1 adc cycle = 8/72MHz
+// total_time = 77.5 + 12.5 adc cycles = 90 adc cycles = 10µs
+// up to 100ksps
+//
+// With adc div 8, sample time 239.5 cycles
+// total time = 239.5 + 12.5 adc cycles = 252 adc cycles = 28µs
+// up to 35ksps
 
 // A0 and A1,   used to meassure signal
 // TIM1 (timer) that tells ADC to meassure
@@ -38,7 +57,7 @@ uint8 pins[] = {PA0, PA1};
 const size_t nPins = sizeof(pins) / sizeof(uint8);
 
 // Array for the ADC data
-const size_t adc_buffer_len = 200 * nPins;
+const size_t adc_buffer_len = 500 * nPins;
 uint16_t adc_buffer[adc_buffer_len];
 
 uint32 nirqs_o = 0;
@@ -132,7 +151,7 @@ void setup_adc()
   // 01: PCLK2/4
   // 10: PCLK2/6
   // 11: PCLK2/8
-  RCC_BASE->CFGR |= RCC_ADCPRE_PCLK_DIV_8;
+  RCC_BASE->CFGR = (RCC_BASE->CFGR & ~RCC_CFGR_ADCPRE) | RCC_ADCPRE_PCLK_DIV_6;
 
   delay_us(1000); // Maybe not needed, whatever
 
@@ -140,9 +159,10 @@ void setup_adc()
   myADC.calibrate();
 
   // myADC.setSampleRate(ADC_SMPR_1_5); //set the Sample Rate
-  myADC.setSampleRate(ADC_SMPR_239_5); // Slowed down for now, TODO
-  myADC.setScanMode();                 //set the ADC in Scan mode.
-  myADC.setPins(pins, nPins);          //set how many and which pins to convert.
+  // myADC.setSampleRate(ADC_SMPR_7_5);
+  myADC.setSampleRate(ADC_SMPR_239_5);
+  myADC.setScanMode();        //set the ADC in Scan mode.
+  myADC.setPins(pins, nPins); //set how many and which pins to convert.
   myADC.resetContinuous();
   // myADC.setContinuous();
   myADC.setTrigger(ADC_EXT_EV_TIM1_CC1);
@@ -218,6 +238,7 @@ extern "C"
 void setup()
 {
   Serial1.begin(1000000);
+  pinMode(error_pin, OUTPUT);
 
   for (size_t i = 0; i < adc_buffer_len; i++)
   {
@@ -242,5 +263,10 @@ void loop()
 {
   // Everything relies on interrupts, do nothing
   asm("wfi \n");
+
+  if (error != NO_ERROR)
+  {
+    digitalWrite(error_pin, HIGH);
+  }
   // TODO, if error, then set LED or somesuch
 };

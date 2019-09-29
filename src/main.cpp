@@ -1,14 +1,21 @@
-// TODO
-// Control input channel
+// A0 and A1,   used to meassure signal
+// TIM1 (timer) that tells ADC to meassure
+// ADC (analog 2 digital converter)  gives us 12bit measurment of voltage
+// DMA (direct memory access)  shuffles them to RAM
+// DMA shuffles the RAM out over serial data port to computer
+
 #include <Arduino.h>
 #include <STM32ADC.h>
 #include <libmaple/timer.h>
 #include <libmaple/usart.h>
 
-static const uint8_t error_pin = 25; // 25 = B12
+static const uint32_t baud_rate = 1200000;
+static const uint8_t error_pin = PB12;
 
-static const uint32_t adc_clock = CLOCK_SPEED_HZ / 8; /// NOTE: configured in setup(), should match!
-static const uint32_t adc_timer_prescaler = 32;
+static const uint8_t adc_clock_divider = 2;
+static const adc_smp_rate adc_sampletime = ADC_SMPR_7_5; // Also change in parameter_sanity_check
+
+static const uint32_t adc_timer_prescaler = 40;
 static const uint32_t adc_timer_arr = 64;
 static const uint32_t adc_samplerate = CLOCK_SPEED_HZ / adc_timer_prescaler / adc_timer_arr;
 // Time to *perform* one sample
@@ -28,17 +35,14 @@ static const uint32_t adc_samplerate = CLOCK_SPEED_HZ / adc_timer_prescaler / ad
 // total time = 239.5 + 12.5 adc cycles = 252 adc cycles = 28µs
 // up to 35ksps
 
-// A0 and A1,   used to meassure signal
-// TIM1 (timer) that tells ADC to meassure
-// ADC (analog 2 digital converter)  gives us 12bit measurment of voltage
-// DMA (direct memory access)  shuffles them to RAM
-// DMA shuffles the RAM out over serial data port to computer
+
 
 enum commands
 {
   CMD_STOP = 1,
   CMD_START = 2,
-  CMD_GET_SAMPLERATE = 3,
+  CMD_GET_SAMPLERATE =  3,
+  CMD_GET_ERROR = 4,
 };
 
 enum error_type
@@ -47,6 +51,9 @@ enum error_type
   USART_BUSY_ERROR = 1,
   ADC_DMA_ERROR = 1 << 2,
   USART_DMA_ERROR = 1 << 3,
+  INVALID_ADC_CLK_DIV = 1 << 4,
+  BAD_PARAMETERS_TIMER_FASTER_THAN_ADC = 1 << 5,
+  BAD_PARAMETERS_SERIAL_TOO_SLOW = 1 << 6,
 };
 volatile uint32_t error = NO_ERROR;
 
@@ -57,7 +64,7 @@ uint8 pins[] = {PA0, PA1};
 const size_t nPins = sizeof(pins) / sizeof(uint8);
 
 // Array for the ADC data
-const size_t adc_buffer_len = 500 * nPins;
+const size_t adc_buffer_len = 200 * nPins;
 uint16_t adc_buffer[adc_buffer_len];
 
 uint32 nirqs_o = 0;
@@ -78,10 +85,11 @@ void trigger_adc_buffer_to_usart(bool second_half)
       DMA_CH4,
       &USART1->regs->DR,
       DMA_SIZE_8BITS,
-      adc_buffer + (second_half ? adc_buffer_len / 2 : 0),
+      adc_buffer + (second_half ? adc_buffer_len / 2: 0),
       DMA_SIZE_8BITS,
       (DMA_MINC_MODE | DMA_FROM_MEM | DMA_TRNS_CMPLT));
-  dma_set_num_transfers(DMA1, DMA_CH4, adc_buffer_len / 2);
+  // Note; /2 because we're transfering half of it, *2 because 16bit data sent as 8bit
+  dma_set_num_transfers(DMA1, DMA_CH4, (adc_buffer_len) * 2 / 2);
   dma_enable(DMA1, DMA_CH4);
 }
 
@@ -151,7 +159,24 @@ void setup_adc()
   // 01: PCLK2/4
   // 10: PCLK2/6
   // 11: PCLK2/8
-  RCC_BASE->CFGR = (RCC_BASE->CFGR & ~RCC_CFGR_ADCPRE) | RCC_ADCPRE_PCLK_DIV_6;
+  uint32_t div = RCC_ADCPRE_PCLK_DIV_8;
+  switch (adc_clock_divider) {
+    case 2:
+      div = RCC_ADCPRE_PCLK_DIV_2;
+      break;
+    case 4:
+      div = RCC_ADCPRE_PCLK_DIV_4;
+      break;
+    case 6:
+      div = RCC_ADCPRE_PCLK_DIV_6;
+      break;
+    case 8:
+      div = RCC_ADCPRE_PCLK_DIV_8;
+      break;
+    default:
+      error |= INVALID_ADC_CLK_DIV;    
+  };
+  RCC_BASE->CFGR = (RCC_BASE->CFGR & ~RCC_CFGR_ADCPRE) | div;
 
   delay_us(1000); // Maybe not needed, whatever
 
@@ -160,7 +185,8 @@ void setup_adc()
 
   // myADC.setSampleRate(ADC_SMPR_1_5); //set the Sample Rate
   // myADC.setSampleRate(ADC_SMPR_7_5);
-  myADC.setSampleRate(ADC_SMPR_239_5);
+  // myADC.setSampleRate(ADC_SMPR_239_5);
+  myADC.setSampleRate(adc_sampletime);
   myADC.setScanMode();        //set the ADC in Scan mode.
   myADC.setPins(pins, nPins); //set how many and which pins to convert.
   myADC.resetContinuous();
@@ -170,12 +196,14 @@ void setup_adc()
   //set the DMA transfer for the ADC.
   //in this case we want to increment the memory side and run it in circular mode
   //By doing this, we can read the last value sampled from the channels by reading the dataPoints array
+  dma_set_priority(DMA1, DMA_CH1, DMA_PRIORITY_HIGH);
+
   myADC.setDMA(
       adc_buffer,
       adc_buffer_len,
       (DMA_MINC_MODE | DMA_CIRC_MODE | DMA_HALF_TRNS | DMA_TRNS_CMPLT),
       adc_dma_irq_handler);
-
+  
   //start the conversion.
   //because the ADC is set as continuous mode and in circular fashion, this can be done
   //on setup().
@@ -190,6 +218,7 @@ void stop()
 void start()
 {
   timer_resume(TIMER1);
+  digitalWrite(error_pin, LOW);
 }
 
 void handle_cmd(uint8_t cmd)
@@ -204,6 +233,9 @@ void handle_cmd(uint8_t cmd)
     break;
   case CMD_GET_SAMPLERATE:
     Serial1.println(adc_samplerate);
+    break;
+  case CMD_GET_ERROR:
+    Serial1.println(error);
     break;
   }
 }
@@ -235,10 +267,36 @@ extern "C"
   }
 }
 
+
+void parameter_sanity_check() {
+  uint32_t channels = nPins;
+
+  // This is 10(adc_smpr + 12.5)
+  uint32_t sampletime_cycles_x10 = 75 + 125;
+
+  // Time it takes for adc to sample all channels, in PCLK cycles
+  uint32_t sampletime = sampletime_cycles_x10 * adc_clock_divider * channels / 10;
+
+  // Time between timer triggers
+  uint32_t timer_interval = adc_timer_prescaler * adc_timer_arr;
+
+
+  if (timer_interval <= sampletime) {
+    error |= BAD_PARAMETERS_TIMER_FASTER_THAN_ADC;
+  }
+
+  uint32_t send_capacity_bytes_per_second = baud_rate / 10;  // 10 bits per byte (2 for star/stop bits)
+  uint32_t requested_bytes_per_second = 2 * channels * (CLOCK_SPEED_HZ / timer_interval);
+  if (send_capacity_bytes_per_second <= requested_bytes_per_second) {
+    error |= BAD_PARAMETERS_SERIAL_TOO_SLOW;
+  }
+}
+
 void setup()
 {
-  Serial1.begin(1000000);
+  Serial1.begin(baud_rate);
   pinMode(error_pin, OUTPUT);
+  parameter_sanity_check();
 
   for (size_t i = 0; i < adc_buffer_len; i++)
   {
@@ -261,12 +319,12 @@ void setup()
 
 void loop()
 {
-  // Everything relies on interrupts, do nothing
-  asm("wfi \n");
-
   if (error != NO_ERROR)
   {
     digitalWrite(error_pin, HIGH);
   }
+  // Everything relies on interrupts, do nothing
+  asm("wfi \n");
+
   // TODO, if error, then set LED or somesuch
 };

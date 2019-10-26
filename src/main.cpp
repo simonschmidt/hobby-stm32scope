@@ -1,4 +1,5 @@
 // A0 and A1,   used to meassure signal
+// USART used for data, pins, A9 TX, A10 RX
 // TIM1 (timer) that tells ADC to meassure
 // ADC (analog 2 digital converter)  gives us 12bit measurment of voltage
 // DMA (direct memory access)  shuffles them to RAM
@@ -43,7 +44,17 @@ enum commands
   CMD_START = 2,
   CMD_GET_SAMPLERATE =  3,
   CMD_GET_ERROR = 4,
+  CMD_SET_TRIGGER = 5,
 };
+enum cmd_state_type
+{
+  CMD_STATE_IDLE = 0,
+  CMD_STATE_READ_ARG = 1,
+};
+
+volatile auto cmd_state = CMD_STATE_IDLE;
+volatile uint8_t cmd_buf[6];
+volatile size_t cmd_buf_ix = 0;
 
 enum error_type
 {
@@ -71,6 +82,11 @@ uint32 nirqs_o = 0;
 
 volatile bool usart_busy = false;
 
+
+// AWG stuff
+volatile uint8_t awg_channel = 0;
+
+
 /* Dump half ADC buffer on usart */
 void trigger_adc_buffer_to_usart(bool second_half)
 {
@@ -93,7 +109,7 @@ void trigger_adc_buffer_to_usart(bool second_half)
   dma_enable(DMA1, DMA_CH4);
 }
 
-void adc_dma_irq_handler()
+void on_adc_dma_complete()
 {
   const auto irq_cause = dma_get_irq_cause(DMA1, DMA_CH1);
   switch (irq_cause)
@@ -116,10 +132,47 @@ void adc_dma_irq_handler()
   return;
 }
 
+void on_adc_awd_interrupt()
+{
+  // Disable watchdog (interrupt bit already cleared)
+  ADC1->regs->CR1 &= ~ADC_CR1_AWDEN;
+
+  DMA1->regs->CMAR1;
+  dma_channel_reg_map *chan_regs;
+
+  chan_regs = dma_channel_regs(DMA1, DMA_CH1);
+  uint16_t * value = reinterpret_cast<uint16_t*>(chan_regs->CMAR);
+
+  const auto offset = (value - &adc_buffer[0])/sizeof(uint16_t);
+
+  const auto channel_for_offset = (int) (offset % nPins);
+  const int channel_delta = channel_for_offset > awg_channel ?
+    // Avoid updating future values as they might get overwritten
+    // but at the same time, these values might already have gone out the UART
+    channel_for_offset - awg_channel - nPins :
+    channel_for_offset - awg_channel
+  ;
+  if (channel_delta > 0) {
+    // Should not be possible
+    // TODO set some error
+    return;
+  }
+
+  size_t update_ix = offset;
+  if (offset + channel_delta >= 0) {
+    update_ix = offset + channel_delta;
+  } else {
+    // TODO not that good as DMA might overwrite these
+    update_ix = (offset + nPins + channel_delta) % adc_buffer_len;
+  }
+  adc_buffer[update_ix] |= 1<<14;
+
+}
+
 volatile bool got_usart_irq = false;
 
 /* Reset usart busy when data has been transferred */
-void usart_irq_handler()
+void on_dma_to_usart_done()
 {
   const dma_irq_cause usart_irq_cause = dma_get_irq_cause(DMA1, DMA_CH4);
   switch (usart_irq_cause)
@@ -195,19 +248,19 @@ void setup_adc()
 
   //set the DMA transfer for the ADC.
   //in this case we want to increment the memory side and run it in circular mode
-  //By doing this, we can read the last value sampled from the channels by reading the dataPoints array
   dma_set_priority(DMA1, DMA_CH1, DMA_PRIORITY_HIGH);
 
   myADC.setDMA(
       adc_buffer,
       adc_buffer_len,
       (DMA_MINC_MODE | DMA_CIRC_MODE | DMA_HALF_TRNS | DMA_TRNS_CMPLT),
-      adc_dma_irq_handler);
+      on_adc_dma_complete);
   
   //start the conversion.
-  //because the ADC is set as continuous mode and in circular fashion, this can be done
-  //on setup().
   myADC.startConversion();
+
+  // enable_awd_irq(ADC1);
+  adc_attach_interrupt(ADC1, ADC_AWD, on_adc_awd_interrupt);
 }
 
 void stop()
@@ -221,38 +274,94 @@ void start()
   digitalWrite(error_pin, LOW);
 }
 
-void handle_cmd(uint8_t cmd)
+
+/**
+ * Trigger mode
+ * - Analog watchog is set up for the specified threshold
+ * - When watchdog triggers, the measured value will be tagged
+ * - User can then detect this tag
+ * - TODO tag should go in the high unused bits, but how to target it correctly in time?
+ */
+void handle_trigger_cmd() {
+  uint8_t cmd = cmd_buf[0];
+  if (cmd != CMD_SET_TRIGGER) {
+    // TODO set error
+    return;
+  }
+  if (cmd_buf_ix < 5) {
+    // Wait for more arguments
+    cmd_state = CMD_STATE_READ_ARG;
+    return;
+  }
+
+  uint8 channel = cmd_buf[1];
+  uint16_t value_low = (((uint16_t)cmd_buf[2]) << 8) + cmd_buf[3]; // TOD low and high, maybe multi-byte
+  uint16_t value_high = (((uint16_t)cmd_buf[4]) << 8) + cmd_buf[5];
+
+  // TODO check that arguments make sense
+
+
+  // set_awd_channel(ADC1, channel);
+  ADC1->regs->CR1 |= (channel & ADC_CR1_AWDCH);
+
+  // set_awd_low_limit(ADC1, (uint32)value_low);
+  // set_awd_high_limit(ADC1, (uint32)value_high);
+  ADC1->regs->LTR = value_low;
+  ADC1->regs->HTR = value_high;
+
+  //   enable_awd(ADC1);
+  ADC1->regs->CR1 |= ADC_CR1_AWDEN;
+
+  cmd_state = CMD_STATE_IDLE;
+}
+
+void handle_cmd()
 {
+  uint8_t cmd = cmd_buf[0];
   switch (cmd)
   {
   case CMD_STOP:
     stop();
+    cmd_state = CMD_STATE_IDLE;
     break;
   case CMD_START:
     start();
+    cmd_state = CMD_STATE_IDLE;
     break;
   case CMD_GET_SAMPLERATE:
     Serial1.println(adc_samplerate);
+    cmd_state = CMD_STATE_IDLE;
     break;
   case CMD_GET_ERROR:
     Serial1.println(error);
+    cmd_state = CMD_STATE_IDLE;
+    break;
+  case CMD_SET_TRIGGER:
+    handle_trigger_cmd();
     break;
   }
 }
+
 
 extern "C"
 {
   void __irq_usart1(void)
   {
     // Reading clears the thing
-    uint8_t cmd = 0;
-    while ((USART1_BASE->SR & USART_SR_RXNE) != 0)
-    {
-      cmd = USART1_BASE->DR & 0xff;
-    };
-    if (cmd != 0)
-    {
-      handle_cmd(cmd);
+    while ((USART1_BASE->SR & USART_SR_RXNE) != 0) {
+      switch (cmd_state) {
+        case CMD_STATE_IDLE:
+          cmd_buf_ix = 0;
+          // fallthrough
+        case CMD_STATE_READ_ARG: {
+          cmd_buf[cmd_buf_ix] = USART1_BASE->DR & 0xff;
+          if (cmd_buf[0] != 0) {
+            handle_cmd();
+            cmd_buf_ix += 1;
+          }
+          break;
+        }
+      }
     }
 
     // This just ties in to existing Serial stuff so Serial1.print keeps working
@@ -309,7 +418,7 @@ void setup()
   // Interrupt on incoming
   USART1->regs->CR1 |= USART_CR1_RXNEIE;
 
-  dma_attach_interrupt(DMA1, DMA_CH4, usart_irq_handler);
+  dma_attach_interrupt(DMA1, DMA_CH4, on_dma_to_usart_done);
 
   setup_timer();
   setup_adc();
@@ -325,6 +434,4 @@ void loop()
   }
   // Everything relies on interrupts, do nothing
   asm("wfi \n");
-
-  // TODO, if error, then set LED or somesuch
 };

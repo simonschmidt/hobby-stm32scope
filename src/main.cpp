@@ -83,8 +83,10 @@ uint32 nirqs_o = 0;
 volatile bool usart_busy = false;
 
 
-// AWG stuff
-volatile uint8_t awg_channel = 0;
+// AWD
+// Set when AWD fired.
+// TODO figure out how to tag the exact event that triggered the interrupt, possible?
+volatile bool adc_awd_did_interrupt = false;
 
 
 /* Dump half ADC buffer on usart */
@@ -96,6 +98,18 @@ void trigger_adc_buffer_to_usart(bool second_half)
     return;
   }
   usart_busy = true;
+
+  // Tag interrupt happened
+  // This sucks as it will wiggle around and not be exactly when the AWD fired.
+  if(adc_awd_did_interrupt) {
+    if (second_half) {
+      adc_buffer[adc_buffer_len / 2] |= 1<<14;
+    } else {
+      adc_buffer[0] |= 1<<14;
+    }
+    adc_awd_did_interrupt = false;
+  }
+
   dma_setup_transfer(
       DMA1,
       DMA_CH4,
@@ -140,33 +154,11 @@ void on_adc_awd_interrupt()
   DMA1->regs->CMAR1;
   dma_channel_reg_map *chan_regs;
 
-  chan_regs = dma_channel_regs(DMA1, DMA_CH1);
-  uint16_t * value = reinterpret_cast<uint16_t*>(chan_regs->CMAR);
 
-  const auto offset = (value - &adc_buffer[0])/sizeof(uint16_t);
-
-  const auto channel_for_offset = (int) (offset % nPins);
-  const int channel_delta = channel_for_offset > awg_channel ?
-    // Avoid updating future values as they might get overwritten
-    // but at the same time, these values might already have gone out the UART
-    channel_for_offset - awg_channel - nPins :
-    channel_for_offset - awg_channel
-  ;
-  if (channel_delta > 0) {
-    // Should not be possible
-    // TODO set some error
-    return;
-  }
-
-  size_t update_ix = offset;
-  if (offset + channel_delta >= 0) {
-    update_ix = offset + channel_delta;
-  } else {
-    // TODO not that good as DMA might overwrite these
-    update_ix = (offset + nPins + channel_delta) % adc_buffer_len;
-  }
-  adc_buffer[update_ix] |= 1<<14;
-
+  // TODO come back to this, this is too error prone
+  // chan_regs = dma_channel_regs(DMA1, DMA_CH1);
+  // uint16_t * value = reinterpret_cast<uint16_t*>(chan_regs->CMAR);
+  adc_awd_did_interrupt = true;
 }
 
 volatile bool got_usart_irq = false;
@@ -329,7 +321,8 @@ void handle_cmd()
     cmd_state = CMD_STATE_IDLE;
     break;
   case CMD_GET_SAMPLERATE:
-    Serial1.println(adc_samplerate);
+    Serial1.write((uint8_t*) &adc_samplerate, 4);
+    // Serial1.println(adc_samplerate);
     cmd_state = CMD_STATE_IDLE;
     break;
   case CMD_GET_ERROR:
